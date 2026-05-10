@@ -5,6 +5,8 @@ from .cuda import *
 from .cpu import *
 from .cdna import *
 from .metal import *
+from .cuda import is_tensorcore_supported_precision as _is_cuda_tensorcore_supported_precision
+from .cdna import is_cdna_tensorcore_supported_precision
 from tvm.target import Target
 import torch
 
@@ -36,6 +38,14 @@ def auto_infer_current_arch() -> TileDevice:
         return get_arch("metal")
     else:
         return get_arch("llvm")
+
+
+def is_tensorcore_supported_precision(in_dtype: str, accum_dtype: str, arch: TileDevice) -> bool:
+    if is_cuda_arch(arch):
+        return _is_cuda_tensorcore_supported_precision(in_dtype, accum_dtype, arch)
+    if is_cdna_arch(arch):
+        return is_cdna_tensorcore_supported_precision(in_dtype, accum_dtype, arch)
+    raise ValueError(f"Unsupported architecture: {arch}")
 
 
 __all__ = [

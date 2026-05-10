@@ -2,14 +2,31 @@ from __future__ import annotations
 import tvm
 from tvm.target import Target
 from .arch_base import TileDevice
+from .cuda import TensorInstruction
 
 # LDS size per CU for specific AMD GPU architectures (in bytes).
 # gfx950 (CDNA4 / MI350): 160 KB — larger than the 64 KB default for gfx942.
 _GFX950_LDS_SIZE = 160 * 1024  # 163840 bytes
 
 
+cdna_tensorcore_supported = [
+    ("bfloat16", "float32"),
+    ("float16", "float32"),
+    ("float16", "float16"),
+    ("int8", "int32"),
+    ("float8_e4m3", "float32"),
+    ("float8_e4m3fnuz", "float32"),
+]
+
+
 def is_cdna_arch(arch: TileDevice) -> bool:
     return isinstance(arch, CDNA)
+
+
+def is_cdna_tensorcore_supported_precision(in_dtype: str, accum_dtype: str, arch: TileDevice) -> bool:
+    if not is_cdna_arch(arch):
+        return False
+    return (in_dtype, accum_dtype) in cdna_tensorcore_supported
 
 
 class CDNA(TileDevice):
@@ -43,9 +60,15 @@ class CDNA(TileDevice):
         self.transaction_size: list[int] = [32, 128]  # in bytes
 
         self.bandwidth: list[int] = [1300, 14000]
+        self.available_tensor_instructions: list[TensorInstruction] = None
+
+    def get_avaliable_tensorintrin_shapes(self):
+        self.available_tensor_instructions = (TensorInstruction("mfma", [16, 16]),)
+        return [t.shape for t in self.available_tensor_instructions]
 
 
 __all__ = [
     "is_cdna_arch",
+    "is_cdna_tensorcore_supported_precision",
     "CDNA",
 ]

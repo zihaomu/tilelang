@@ -77,6 +77,27 @@ def test_matmul_recommend_hints():
     run_matmul_recommend_hints(1024, 1024, 1024, T.float16, T.float32, T.float16)
 
 
+@tilelang.testing.requires_rocm
+def test_rocm_matmul_recommend_hints_use_mfma():
+    from tilelang.utils.target import target_has_async_copy
+
+    arch = auto_infer_current_arch()
+    carve_template = carver.MatmulTemplate(
+        M=1024,
+        N=1024,
+        K=1024,
+        in_dtype=T.float16,
+        out_dtype=T.float16,
+        accum_dtype=T.float32,
+    ).with_arch(arch)
+
+    hints = carve_template.recommend_hints(topk=5)
+    assert len(hints) > 0
+    assert any(hint.use_tc for hint in hints)
+    if target_has_async_copy(arch.target):
+        assert any(hint.pipeline_stage == 2 and hint.use_async for hint in hints)
+
+
 def run_gemv_recommend_hints(
     N: int = 1024, K: int = 1024, in_dtype: T.dtype = T.float16, out_dtype: T.dtype = T.float16, accum_dtype: T.dtype = T.float16
 ):

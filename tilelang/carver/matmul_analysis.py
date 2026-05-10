@@ -39,6 +39,23 @@ def _is_one(x: PrimExpr) -> bool:
     return isinstance(x, tir.IntImm) and x.value == 1
 
 
+def _is_cuda_tensorcore_target(target: Target) -> bool:
+    return target.kind.name == "cuda" and check_sm_version(target.arch) >= 70
+
+
+def _is_cdna_tensorcore_target(target: Target) -> bool:
+    return target.kind.name == "hip"
+
+
+def _target_has_async_copy(target: Target) -> bool:
+    try:
+        from tilelang.utils.target import target_has_async_copy
+
+        return target_has_async_copy(target)
+    except Exception:
+        return False
+
+
 def _collect_producers(sch: tir.Schedule, block: tir.schedule.BlockRV):
     result = []
     for producer in sch.get_producers(block):
@@ -544,9 +561,7 @@ def get_tensorized_func_and_tags(
         tags: dict[str, list[int] | int] = {}
         block_stmt = sch.get(block)
 
-        # Nvidia Only Support Tensor Core for
-        # devices greater than 70.
-        if check_sm_version(target.arch) < 70:
+        if not (_is_cuda_tensorcore_target(target) or _is_cdna_tensorcore_target(target)):
             return False
         # analysis tensorcore axis
         # todo(lei): maybe we can remove this in the future
@@ -560,12 +575,16 @@ def get_tensorized_func_and_tags(
         if target.kind.name == "cuda" and check_sm_version(target.arch) in {80, 90}:
             # enable pipeline stage only for sm_80 devices
             tags["pipeline_stage"] = 2
+        elif _is_cdna_tensorcore_target(target) and _target_has_async_copy(target):
+            tags["pipeline_stage"] = 2
 
         # analysis async copy
         # todo(lei): maybe we can integrate this into policy in the future
         tags["use_async_copy"] = False
         if tags["pipeline_stage"] == 2 and check_sm_version(target.arch) in {80, 90}:
             # async copy only works in software pipeline.
+            tags["use_async_copy"] = True
+        elif _is_cdna_tensorcore_target(target) and _target_has_async_copy(target):
             tags["use_async_copy"] = True
 
         # analysis intrin information
@@ -625,7 +644,7 @@ def get_tensorized_func_and_tags(
         return func, None
 
     block_stmt = sch.get(main_block)
-    if target.kind.name == "cuda" and check_sm_version(target.arch) >= 70:
+    if _is_cuda_tensorcore_target(target) or _is_cdna_tensorcore_target(target):
         in_dtype, out_dtype = get_in_out_dtypes(block_stmt)
         if not is_tensorcore_supported_precision(in_dtype, out_dtype, arch=get_arch(target)):
             logger.debug(f"The input and output dtype ({in_dtype}, {out_dtype})is not supported by tensorcore")
