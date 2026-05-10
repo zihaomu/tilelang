@@ -1,6 +1,15 @@
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.utils import determine_fp8_type, determine_torch_fp8_type
+
+
+def _fp8_e4m3_torch_dtype() -> torch.dtype:
+    return determine_torch_fp8_type("e4m3")
+
+
+def _fp8_e4m3_max() -> float:
+    return torch.finfo(_fp8_e4m3_torch_dtype()).max
 
 
 def fast_log2_ceil(x):
@@ -35,9 +44,10 @@ def fp8_quant_kernel(
 
     M = T.dynamic("M")
     N = T.const("N")
-    fp8_min, fp8_max = -448.0, 448.0
+    fp8_max = _fp8_e4m3_max()
+    fp8_min = -fp8_max
     in_dtype = T.bfloat16
-    out_dtype = T.float8_e4m3
+    out_dtype = determine_fp8_type("e4m3")
     scale_dtype = T.float32
     compute_dtype = T.float32  # Internal computation in FP32;
 
@@ -86,7 +96,7 @@ def fp8_quant_kernel(
 
 
 def fp8_act_quant(x: torch.Tensor, block_size: int = 128, round_scale: bool = False):
-    """Block-wise FP8 quantization (bf16 -> fp8_e4m3).
+    """Block-wise FP8 quantization (bf16 -> platform E4M3 FP8).
 
     Args:
         x: Input tensor, shape (..., N) with N divisible by block_size, dtype bfloat16.
@@ -94,7 +104,8 @@ def fp8_act_quant(x: torch.Tensor, block_size: int = 128, round_scale: bool = Fa
         round_scale: If True, round scale to nearest power of 2 (MXFP style).
 
     Returns:
-        quant: FP8 quantized tensor, same shape as x, dtype float8_e4m3fn.
+        quant: FP8 quantized tensor, same shape as x. CUDA uses
+            float8_e4m3fn; ROCm gfx942 uses float8_e4m3fnuz.
         scale: Per-block scales, shape (..., N // block_size), dtype float32.
     """
     N = x.size(-1)
@@ -192,11 +203,12 @@ def fp8_act_quant_ref(x: torch.Tensor, block_size: int = 128, round_scale: bool 
     """PyTorch reference for block-wise FP8 quantization.
 
     Returns:
-        quant: shape (M, N), dtype torch.float8_e4m3fn.
+        quant: shape (M, N), dtype selected by determine_torch_fp8_type("e4m3").
         scale: shape (M, num_blocks), dtype torch.float32.
     """
     M, N = x.shape
-    fp8_max = 448.0
+    fp8_dtype = _fp8_e4m3_torch_dtype()
+    fp8_max = torch.finfo(fp8_dtype).max
     num_blocks = N // block_size
     x_float = x.float().reshape(M, num_blocks, block_size)
     amax = x_float.abs().amax(dim=-1).clamp(min=1e-4)
@@ -206,7 +218,7 @@ def fp8_act_quant_ref(x: torch.Tensor, block_size: int = 128, round_scale: bool 
         scale = amax / fp8_max
     x_scaled = x_float / scale.unsqueeze(-1)
     x_clamped = x_scaled.clamp(-fp8_max, fp8_max)
-    quant = x_clamped.reshape(M, N).to(torch.float8_e4m3fn)
+    quant = x_clamped.reshape(M, N).to(fp8_dtype)
     return quant, scale
 
 
@@ -315,7 +327,7 @@ def test_fp8_act_quant(M: int = 256, N: int = 1024, block_size: int = 128):
 
         # Compare scales
         torch.testing.assert_close(scale_tl.float(), scale_ref.float(), rtol=1e-5, atol=1e-5)
-        # Compare quantized values (both float8_e4m3fn, compare as float32)
+        # Compare quantized values (same platform E4M3 FP8 dtype, compare as float32)
         torch.testing.assert_close(quant_tl.float(), quant_ref.float(), rtol=0, atol=0)
 
     print(f"[PASS] test_fp8_act_quant M={M}, N={N}, block_size={block_size}")
