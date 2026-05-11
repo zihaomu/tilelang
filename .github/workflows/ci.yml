@@ -193,6 +193,8 @@ jobs:
           echo "ROCM_VERSION_MAJMIN_NODOT=${ROCM_VERSION_MAJMIN_NODOT}" | tee -a "${GITHUB_ENV}"
           echo "PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}" | tee -a "${GITHUB_ENV}"
           echo "UV_INDEX=${UV_INDEX}" | tee -a "${GITHUB_ENV}"
+          echo "TVM_FFI_SKIP_C_DLPACK_EXCHANGE_API=1" | tee -a "${GITHUB_ENV}"
+          echo "TVM_FFI_DISABLE_TORCH_C_DLPACK=1" | tee -a "${GITHUB_ENV}"
 
           if [[ ! -x "$(command -v hipcc)" ]]; then
             export PATH="/opt/rocm/bin:${PATH}"
