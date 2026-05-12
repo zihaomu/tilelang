@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 class CuTeDSLKernelAdapter(BaseKernelAdapter):
     pymodule = None
 
+    @staticmethod
+    def _torch_storage_shape(param: KernelParam, shape: list[int]) -> list[int]:
+        if str(param.dtype) != "float4_e2m1fn" or not shape:
+            return shape
+        storage_shape = list(shape)
+        storage_shape[-1] = (storage_shape[-1] + 1) // 2
+        return storage_shape
+
     def __init__(
         self,
         params: list[KernelParam],
@@ -342,6 +350,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
                             raise ValueError(f"Unknown dynamic symbol ref id: {ref_id}")
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
+                shape = self._torch_storage_shape(self.params[i], shape)
                 tensor = torch.empty(*shape, dtype=dtype, device=first_tensor.device)
                 param_values[i] = tensor
             else:

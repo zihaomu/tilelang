@@ -1459,6 +1459,103 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
   PrimExpr index_expr = op->indices[0];
   Var buffer_var = op->buffer->data;
 
+  if (element_dtype.element_of().is_float4_e2m1fn()) {
+    // CuTeDSL cannot dereference sub-byte FP4 tensors directly.  Lower the
+    // two TileLang FP4 store patterns through the physical Uint8 backing store:
+    // fp32->fp4 vector casts and fp4 vector copies.
+    int value_lanes = value_dtype.lanes();
+    ICHECK_EQ(value_lanes % 2, 0)
+        << "CuTeDSL float4_e2m1fn packed lowering requires an even lane count "
+           "because two logical FP4 values are packed per byte.";
+
+    auto scalar_base_for =
+        [&](PrimExpr index, DataType access_dtype,
+            DataType buffer_elem_dtype) -> PrimExpr {
+      int access_lanes = access_dtype.lanes();
+      int buffer_lanes = buffer_elem_dtype.lanes();
+      ICHECK_GT(access_lanes, 0);
+      ICHECK_GT(buffer_lanes, 0);
+      if (access_lanes == buffer_lanes) {
+        return index * access_lanes;
+      }
+      ICHECK_EQ(access_lanes % buffer_lanes, 0)
+          << "CuTeDSL float4_e2m1fn packed lowering expects the access lane "
+             "count to be a multiple of the buffer lane count.";
+      arith::PVar<PrimExpr> ramp_base;
+      ICHECK(arith::ramp(ramp_base, 1, access_lanes / buffer_lanes)
+                 .Match(index))
+          << "CuTeDSL float4_e2m1fn packed lowering only supports contiguous "
+             "logical FP4 vector stores/copies.";
+      return ramp_base.Eval() * buffer_lanes;
+    };
+
+    auto packed_byte_view = [&](const BufferNode *buffer,
+                                PrimExpr logical_scalar_base, int byte_lanes,
+                                const char *prefix) -> std::string {
+      std::string vid = GetVarID(buffer->data.get());
+      PrimExpr byte_base =
+          arith::Analyzer().Simplify(tvm::truncdiv(logical_scalar_base, 2));
+      std::string view_var = name_supply_->FreshName(prefix);
+      PrintIndent();
+      stream << view_var << " = tl.make_tensor_at_offset(tl.recast_ptr("
+             << vid << ".iterator, dtype=cutlass.Uint8), "
+             << PrintExpr_(byte_base) << ", (" << byte_lanes << ",))\n";
+      return view_var;
+    };
+
+    if (const auto *cast = op->value.as<CastNode>();
+        cast && cast->dtype.element_of().is_float4_e2m1fn()) {
+      DataType src_dtype = cast->value.dtype();
+      ICHECK_EQ(src_dtype.lanes(), value_lanes)
+          << "float4_e2m1fn cast store expects matching source lanes.";
+      PrimExpr scalar_base =
+          scalar_base_for(index_expr, value_dtype, element_dtype);
+      int byte_lanes = value_lanes / 2;
+      std::string dst_view = packed_byte_view(op->buffer.get(), scalar_base,
+                                              byte_lanes, "_fp4_dst");
+      std::string src = SSAGetID(PrintExpr_(cast->value), src_dtype);
+      for (int i = 0; i < byte_lanes; ++i) {
+        PrintIndent();
+        stream << dst_view << "[" << i
+               << "] = tl.pack_float32_to_fp4_e2m1fn_x2(cutlass.Float32("
+               << src << "[" << (2 * i)
+               << "]), cutlass.Float32(" << src << "[" << (2 * i + 1)
+               << "]))\n";
+      }
+      return;
+    }
+
+    if (const auto *load = op->value.as<BufferLoadNode>();
+        load && load->dtype.element_of().is_float4_e2m1fn()) {
+      ICHECK_EQ(load->indices.size(), 1)
+          << "Load from non-flat memory not supported.";
+      ICHECK_EQ(load->dtype.lanes(), value_lanes)
+          << "float4_e2m1fn byte copy expects matching lanes.";
+      PrimExpr dst_scalar_base =
+          scalar_base_for(index_expr, value_dtype, element_dtype);
+      PrimExpr src_scalar_base =
+          scalar_base_for(load->indices[0], load->dtype, load->buffer->dtype);
+      int byte_lanes = value_lanes / 2;
+      std::string dst_view = packed_byte_view(op->buffer.get(), dst_scalar_base,
+                                              byte_lanes, "_fp4_dst");
+      std::string src_view = packed_byte_view(load->buffer.get(),
+                                              src_scalar_base, byte_lanes,
+                                              "_fp4_src");
+      for (int i = 0; i < byte_lanes; ++i) {
+        PrintIndent();
+        stream << dst_view << "[" << i << "] = " << src_view << "[" << i
+               << "]\n";
+      }
+      return;
+    }
+
+    LOG(FATAL) << "Unsupported CuTeDSL float4_e2m1fn store value: "
+               << op->value
+               << ". Supported forms are Cast(vector -> float4_e2m1fn) stores "
+                  "and float4_e2m1fn vector copies; both must be contiguous "
+                  "even-lane accesses.";
+  }
+
   // Pre-compute Select/if_then_else as tl.where() at statement level.
   // Python ternary (ArithValue) is rejected by CuTeDSL .store(); tl.where()
   // produces TensorSSA which works in all store paths (.store(), vec store,
@@ -1740,16 +1837,32 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const AllocateNode *op) {
         << constant_size << " for " << op->buffer_var->name_hint;
 
     if (scope == "shared") {
-      stream << vid << " = tl.make_tensor(tl.alloc_smem(";
-      PrintType(op->dtype, stream);
-      stream << ", " << constant_size << "), (" << constant_size << ",))\n";
+      if (op->dtype.is_float4_e2m1fn()) {
+        // Logical FP4 shared buffers use a packed Uint8 backing store because
+        // CuTeDSL does not support scalar dereference of sub-byte FP4 tensor
+        // elements.
+        size_t packed_size = (constant_size + 1) / 2;
+        stream << vid << " = tl.make_tensor(tl.alloc_smem(cutlass.Uint8, "
+               << packed_size << "), (" << packed_size << ",))\n";
+      } else {
+        stream << vid << " = tl.make_tensor(tl.alloc_smem(";
+        PrintType(op->dtype, stream);
+        stream << ", " << constant_size << "), (" << constant_size << ",))\n";
+      }
     } else if (scope == "shared.barrier" || scope == "shared.cluster_barrier") {
       stream << vid << " = tl.alloc_smem(cutlass.Uint64, size_in_elems="
              << constant_size << ")\n";
     } else if (scope == "local") {
-      stream << vid << " = tl.make_rmem_tensor((" << constant_size << "),";
-      PrintType(op->dtype, stream);
-      stream << ")\n";
+      if (op->dtype.is_float4_e2m1fn()) {
+        // See the shared FP4 allocation above: the physical storage is Uint8.
+        size_t packed_size = (constant_size + 1) / 2;
+        stream << vid << " = tl.make_rmem_tensor((" << packed_size
+               << ",), cutlass.Uint8)\n";
+      } else {
+        stream << vid << " = tl.make_rmem_tensor((" << constant_size << "),";
+        PrintType(op->dtype, stream);
+        stream << ")\n";
+      }
     } else if (scope == "local.var") {
       PrimExpr init = tir::make_const(op->dtype, 0);
       auto init_it = op->annotations.find(tl::attr::kLocalVarInit);

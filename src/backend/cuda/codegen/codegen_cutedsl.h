@@ -75,6 +75,7 @@ protected:
   std::string GetBufferRef_(DataType t, const BufferNode *buffer,
                             PrimExpr index) override;
 
+
   // Get pointer string from a Var expression (local buffer -> vid.iterator)
   std::string GetVarPtr_(const PrimExpr &expr);
 

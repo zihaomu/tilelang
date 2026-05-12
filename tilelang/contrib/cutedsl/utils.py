@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass.base_dsl.typing import Int8, Int16, Int32, Uint8, Uint16, Uint32, Float16, Float32, BFloat16
-from cutlass._mlir.dialects import llvm, nvvm
+from cutlass._mlir.dialects import arith, llvm, nvvm
 from cutlass._mlir import ir as mlir_ir
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -23,6 +23,7 @@ __all__ = [
     "shuffle_elect",
     "sync_thread_partial",
     "pack_half2",
+    "pack_float32_to_fp4_e2m1fn_x2",
 ]
 
 BYTES_PER_TENSORMAP = 128
@@ -163,3 +164,67 @@ def pack_half2(x, y):
         return Int32(packed_xy)
 
     return pack_half2_impl(x, y)
+
+
+def _fp4_e2m1fn_nibble_ir(x_ir, *, loc=None, ip=None):
+    zero_f = Float32(0.0).ir_value(loc=loc, ip=ip)
+    is_neg = arith.cmpf(arith.CmpFPredicate.OLT, x_ir, zero_f, loc=loc, ip=ip)
+    neg_x = arith.subf(zero_f, x_ir, loc=loc, ip=ip)
+    abs_x = arith.select(is_neg, neg_x, x_ir, loc=loc, ip=ip)
+
+    nibble = Uint8(0).ir_value(loc=loc, ip=ip)
+    # Round to nearest e2m1 value with lower-value tie breaking.  The finite
+    # positive values are 0, 0.5, 1, 1.5, 2, 3, 4, and 6, so strict threshold
+    # comparisons match the reference argmin behavior on exact midpoints.
+    for threshold, code in (
+        (0.25, 1),
+        (0.75, 2),
+        (1.25, 3),
+        (1.75, 4),
+        (2.5, 5),
+        (3.5, 6),
+        (5.0, 7),
+    ):
+        cond = arith.cmpf(
+            arith.CmpFPredicate.OGT,
+            abs_x,
+            Float32(threshold).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+        nibble = arith.select(
+            cond,
+            Uint8(code).ir_value(loc=loc, ip=ip),
+            nibble,
+            loc=loc,
+            ip=ip,
+        )
+
+    sign = arith.select(
+        is_neg,
+        Uint8(8).ir_value(loc=loc, ip=ip),
+        Uint8(0).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return arith.ori(nibble, sign, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def pack_float32_to_fp4_e2m1fn_x2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uint8:
+    """Pack two float32 values as one byte of Float4E2M1FN nibbles.
+
+    The low nibble stores ``x0`` and the high nibble stores ``x1``.  The
+    unsigned code map is ``[0, 0.5, 1, 1.5, 2, 3, 4, 6]``; bit 3 is the sign.
+    This mirrors the physical ``float4_e2m1fn_x2`` storage used by PyTorch and
+    the CuTeDSL codegen.
+    """
+    low = _fp4_e2m1fn_nibble_ir(Float32(x0).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    high = _fp4_e2m1fn_nibble_ir(Float32(x1).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    high = arith.shli(
+        high,
+        Uint8(4).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return Uint8(arith.ori(low, high, loc=loc, ip=ip))
