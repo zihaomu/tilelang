@@ -8,6 +8,7 @@ On non-CUDA builds, the stream/device fall back to 0/CPU semantics.
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Callable, Any
 import os
 import sys
@@ -27,36 +28,61 @@ from tilelang.language.dtypes import dtype
 COMPILE_ARGS = {}
 
 
-def _torch_float8_dtypes() -> tuple[torch.dtype, ...]:
-    return tuple(
-        dtype
-        for name in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
-        if (dtype := getattr(torch, name, None)) is not None
-    )
+_TORCH_FLOAT8_DTYPE_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
 
 
-_TORCH_FLOAT8_DTYPES = _torch_float8_dtypes()
+def _torch_float8_dtype_name(torch_dtype: torch.dtype) -> str | None:
+    for name in _TORCH_FLOAT8_DTYPE_NAMES:
+        if torch_dtype == getattr(torch, name, None):
+            return name
+    return None
 
 
-def _maybe_export_float8_as_tvm_view(arg: Any, expected_dtype: dtype) -> Any:
-    if not isinstance(arg, torch.Tensor) or arg.dtype not in _TORCH_FLOAT8_DTYPES:
-        return arg
+def _tvm_ffi_uses_torch_python_dlpack_fallback() -> bool:
+    if os.environ.get("TVM_FFI_SKIP_DLPACK_C_EXCHANGE_API", "0") == "1":
+        return True
+    return not hasattr(torch.Tensor, "__dlpack_c_exchange_api__")
 
-    # Some ROCm fallback environments cannot export FP8 tensors through
+
+@cache
+def _torch_dlpack_supports_dtype(dtype_name: str, device_type: str) -> bool:
+    torch_dtype = getattr(torch, dtype_name, None)
+    if torch_dtype is None:
+        return False
+    try:
+        probe = torch.empty((1,), device=device_type, dtype=torch_dtype)
+        torch.utils.dlpack.to_dlpack(probe)
+    except BufferError:
+        return False
+    except Exception as err:  # pragma: no cover - depends on torch/device build details.
+        return "not supported by dlpack" not in str(err).lower()
+    return True
+
+
+def _export_float8_as_tvm_view(arg: torch.Tensor, expected_dtype: dtype) -> Any:
+    # Some fallback environments cannot export FP8 tensors through
     # torch.utils.dlpack directly. Export byte storage and restore the TileLang
-    # logical dtype on the TVM view used for the runtime call.
+    # logical dtype on the TVM view used only for this runtime call.
     tvm_tensor = runtime.from_dlpack(torch.utils.dlpack.to_dlpack(arg.view(torch.int8)))
     return tvm_tensor._create_view(arg.shape, dtype=str(expected_dtype))
 
 
-def _rocm_float8_fallback_param_mask(params: list[KernelParam]) -> tuple[bool, ...] | None:
+def _rocm_float8_storage_view_param_mask(params: list[KernelParam]) -> tuple[bool, ...] | None:
     if getattr(torch.version, "hip", None) is None:
         return None
-    if os.environ.get("TVM_FFI_DISABLE_TORCH_C_DLPACK", "0") == "0":
+    if not _tvm_ffi_uses_torch_python_dlpack_fallback():
         return None
 
-    mask = tuple(str(param.dtype).startswith("float8") for param in params)
-    return mask if any(mask) else None
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    mask: list[bool] = []
+    for param in params:
+        if not param.is_float8():
+            mask.append(False)
+            continue
+        dtype_name = _torch_float8_dtype_name(param.torch_dtype())
+        mask.append(dtype_name is not None and not _torch_dlpack_supports_dtype(dtype_name, device_type))
+    mask_tuple = tuple(mask)
+    return mask_tuple if any(mask_tuple) else None
 
 
 if sys.platform == "darwin":
@@ -217,7 +243,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
 
         dynamic_symbolic_map = self._process_dynamic_symbolic()
         executable = self.executable
-        rocm_float8_fallback_param_mask = _rocm_float8_fallback_param_mask(self.params)
+        rocm_float8_storage_view_param_mask = _rocm_float8_storage_view_param_mask(self.params)
 
         # Prepare helpers for friendly dtype error messages
         prim_func = self.prim_func
@@ -248,7 +274,7 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             # Stitch the full positional argument list expected by the TVM executable
             ins_idx: int = 0
             tensor_list: list[torch.Tensor] = []
-            runtime_args: list[Any] | None = [] if rocm_float8_fallback_param_mask is not None else None
+            runtime_args: list[Any] | None = [] if rocm_float8_storage_view_param_mask is not None else None
 
             # Prepare input and output tensors
             for i in range(len(self.params)):
@@ -286,8 +312,8 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 tensor_list.append(tensor)
 
                 if runtime_args is not None:
-                    if rocm_float8_fallback_param_mask[i]:
-                        runtime_args.append(_maybe_export_float8_as_tvm_view(tensor, self.params[i].dtype))
+                    if rocm_float8_storage_view_param_mask[i]:
+                        runtime_args.append(_export_float8_as_tvm_view(tensor, self.params[i].dtype))
                     else:
                         runtime_args.append(tensor)
 
