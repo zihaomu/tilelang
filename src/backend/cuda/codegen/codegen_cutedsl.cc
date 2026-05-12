@@ -1460,15 +1460,18 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
   Var buffer_var = op->buffer->data;
 
   if (element_dtype.element_of().is_float4_e2m1fn()) {
-    // CuTeDSL cannot dereference sub-byte FP4 tensors directly.  Lower the
-    // two TileLang FP4 store patterns through the physical Uint8 backing store:
-    // fp32->fp4 vector casts and fp4 vector copies.
+    // Physical layout for this CuTeDSL special case:
+    // - TileLang IR is logical FP4: one Float4E2M1FN per element.
+    // - CuTeDSL storage is physical bytes: logical element i lives in byte
+    //   i / 2; even lanes use the low nibble, odd lanes use the high nibble.
+    // - Only the two patterns emitted by act-quant/T.copy are lowered here:
+    //   fp32-vector -> FP4-vector casts and FP4-vector byte copies.
     int value_lanes = value_dtype.lanes();
     ICHECK_EQ(value_lanes % 2, 0)
         << "CuTeDSL float4_e2m1fn packed lowering requires an even lane count "
            "because two logical FP4 values are packed per byte.";
 
-    auto scalar_base_for =
+    auto logical_scalar_base_for =
         [&](PrimExpr index, DataType access_dtype,
             DataType buffer_elem_dtype) -> PrimExpr {
       int access_lanes = access_dtype.lanes();
@@ -1489,7 +1492,7 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
       return ramp_base.Eval() * buffer_lanes;
     };
 
-    auto packed_byte_view = [&](const BufferNode *buffer,
+    auto uint8_storage_view = [&](const BufferNode *buffer,
                                 PrimExpr logical_scalar_base, int byte_lanes,
                                 const char *prefix) -> std::string {
       std::string vid = GetVarID(buffer->data.get());
@@ -1509,11 +1512,13 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
       ICHECK_EQ(src_dtype.lanes(), value_lanes)
           << "float4_e2m1fn cast store expects matching source lanes.";
       PrimExpr scalar_base =
-          scalar_base_for(index_expr, value_dtype, element_dtype);
+          logical_scalar_base_for(index_expr, value_dtype, element_dtype);
       int byte_lanes = value_lanes / 2;
-      std::string dst_view = packed_byte_view(op->buffer.get(), scalar_base,
-                                              byte_lanes, "_fp4_dst");
+      std::string dst_view = uint8_storage_view(op->buffer.get(), scalar_base,
+                                                byte_lanes, "_fp4_dst");
       std::string src = SSAGetID(PrintExpr_(cast->value), src_dtype);
+      // The user op performs rounding and returns one packed byte for a pair
+      // of logical FP4 lanes.
       for (int i = 0; i < byte_lanes; ++i) {
         PrintIndent();
         stream << dst_view << "[" << i
@@ -1532,15 +1537,16 @@ void CodeGenTileLangCuTeDSL::VisitStmt_(const BufferStoreNode *op) {
       ICHECK_EQ(load->dtype.lanes(), value_lanes)
           << "float4_e2m1fn byte copy expects matching lanes.";
       PrimExpr dst_scalar_base =
-          scalar_base_for(index_expr, value_dtype, element_dtype);
+          logical_scalar_base_for(index_expr, value_dtype, element_dtype);
       PrimExpr src_scalar_base =
-          scalar_base_for(load->indices[0], load->dtype, load->buffer->dtype);
+          logical_scalar_base_for(load->indices[0], load->dtype,
+                                  load->buffer->dtype);
       int byte_lanes = value_lanes / 2;
-      std::string dst_view = packed_byte_view(op->buffer.get(), dst_scalar_base,
-                                              byte_lanes, "_fp4_dst");
-      std::string src_view = packed_byte_view(load->buffer.get(),
-                                              src_scalar_base, byte_lanes,
-                                              "_fp4_src");
+      std::string dst_view = uint8_storage_view(
+          op->buffer.get(), dst_scalar_base, byte_lanes, "_fp4_dst");
+      std::string src_view = uint8_storage_view(
+          load->buffer.get(), src_scalar_base, byte_lanes, "_fp4_src");
+      // FP4-to-FP4 copies preserve already-packed bytes; no unpack/repack.
       for (int i = 0; i < byte_lanes; ++i) {
         PrintIndent();
         stream << dst_view << "[" << i << "] = " << src_view << "[" << i
