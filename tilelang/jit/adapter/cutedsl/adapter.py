@@ -24,9 +24,7 @@ class CuTeDSLKernelAdapter(BaseKernelAdapter):
 
     @staticmethod
     def _torch_storage_shape(param: KernelParam, shape: list[int]) -> list[int]:
-        """Return the physical torch allocation shape for a logical TileLang output."""
-        # PyTorch stores two float4_e2m1fn values per byte in the last logical
-        # dimension, matching the Uint8 backing store emitted by CuTeDSL codegen.
+        # torch stores float4_e2m1fn as packed x2 along the last dimension.
         if str(param.dtype) != "float4_e2m1fn" or not shape:
             return shape
         storage_shape = list(shape)
